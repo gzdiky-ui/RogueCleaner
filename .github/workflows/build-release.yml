@@ -1,0 +1,129 @@
+name: Build/release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布到的 Release 标签（例如 v2.0.17）；留空则只构建不发布"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || (github.event_name == 'push' && startsWith(github.ref_name, 'v') && github.ref_name) || '' }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Compile EXE (csc / .NET Framework 4.x)
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\Build-Exe.ps1
+
+      - name: Package release files
+        id: package
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = (Get-Location).Path
+          $version = ([string]$env:TAG).Trim().TrimStart('v')
+          if ([string]::IsNullOrWhiteSpace($version)) { $version = (Get-Date -Format 'yyyyMMdd') }
+          $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+          $outRoot = Join-Path $root 'ci-release'
+          if (Test-Path -LiteralPath $outRoot) { Remove-Item -LiteralPath $outRoot -Recurse -Force }
+          New-Item -ItemType Directory -Path $outRoot | Out-Null
+
+          $exeSrc = Join-Path $root 'dist\流氓软件克星\流氓软件克星.exe'
+          if (-not (Test-Path -LiteralPath $exeSrc)) { throw "未找到编译产物: $exeSrc" }
+
+          $directExe = Join-Path $outRoot "RogueCleaner-v$version-$stamp.exe"
+          Copy-Item -LiteralPath $exeSrc -Destination $directExe -Force
+
+          # 源码包与纯 EXE 包的暂存目录
+          $stageRoot = Join-Path $outRoot '_stage'
+          $sourceStage = Join-Path $stageRoot 'RogueCleaner-Source'
+          $exeStage = Join-Path $stageRoot 'RogueCleaner-Transparent'
+          New-Item -ItemType Directory -Path $sourceStage, $exeStage | Out-Null
+
+          foreach ($f in @('LICENSE', 'Build-Exe.ps1', 'Build-Release-Packages.ps1', '.gitignore')) {
+              Copy-Item -LiteralPath (Join-Path $root $f) -Destination $sourceStage -Force
+          }
+          $sourceSrc = Join-Path $sourceStage 'src'
+          New-Item -ItemType Directory -Path $sourceSrc | Out-Null
+          foreach ($f in @('app.manifest', 'app.ico', 'app-icon.png')) {
+              Copy-Item -LiteralPath (Join-Path $root "src\$f") -Destination $sourceSrc -Force
+          }
+          Copy-Item -LiteralPath (Join-Path $root 'src\v2') -Destination $sourceSrc -Recurse -Force
+          Copy-Item -LiteralPath $exeSrc -Destination (Join-Path $exeStage '流氓软件克星.exe') -Force
+
+          # WinRAR 优先，缺失时回退 ZIP
+          $rar = $null
+          foreach ($c in @("$env:ProgramFiles\WinRAR\Rar.exe", "$env:ProgramFiles\WinRAR\WinRAR.exe")) {
+              if (Test-Path -LiteralPath $c) { $rar = $c; break }
+          }
+          $ext = 'rar'
+          if ($rar) {
+              Push-Location $stageRoot
+              try {
+                  & $rar a -r -m5 -idq (Join-Path $outRoot "RogueCleaner-Source-v$version-$stamp.rar") 'RogueCleaner-Source'
+                  if ($LASTEXITCODE -ne 0) { throw "源码 RAR 打包失败，退出码 $LASTEXITCODE" }
+                  & $rar a -r -m5 -idq (Join-Path $outRoot "RogueCleaner-Transparent-v$version-$stamp.rar") 'RogueCleaner-Transparent'
+                  if ($LASTEXITCODE -ne 0) { throw "EXE RAR 打包失败，退出码 $LASTEXITCODE" }
+              }
+              finally { Pop-Location }
+          } else {
+              Write-Warning '未找到 WinRAR，回退为 ZIP 打包'
+              $ext = 'zip'
+              Compress-Archive -LiteralPath $sourceStage -DestinationPath (Join-Path $outRoot "RogueCleaner-Source-v$version-$stamp.zip") -Force
+              Compress-Archive -LiteralPath $exeStage -DestinationPath (Join-Path $outRoot "RogueCleaner-Transparent-v$version-$stamp.zip") -Force
+          }
+          $sourceArchive = Join-Path $outRoot "RogueCleaner-Source-v$version-$stamp.$ext"
+          $exeArchive = Join-Path $outRoot "RogueCleaner-Transparent-v$version-$stamp.$ext"
+          Remove-Item -LiteralPath $stageRoot -Recurse -Force
+
+          $hashFile = Join-Path $outRoot "SHA256SUMS-v$version-$stamp.txt"
+          $lines = foreach ($p in @($directExe, $exeArchive, $sourceArchive)) {
+              '{0}  {1}' -f (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant(), (Split-Path -Leaf $p)
+          }
+          [System.IO.File]::WriteAllLines($hashFile, $lines, [System.Text.UTF8Encoding]::new($false))
+
+          $files = @($directExe, $exeArchive, $sourceArchive, $hashFile)
+          "VERSION=$version" >> $env:GITHUB_OUTPUT
+          "FILES<<EOT" >> $env:GITHUB_OUTPUT
+          Add-Content -Path $env:GITHUB_OUTPUT -Value ($files -join "`n")
+          "EOT" >> $env:GITHUB_OUTPUT
+          foreach ($f in $files) { Write-Host ('Artifact: ' + (Split-Path -Leaf $f)) }
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rogue-cleaner-build
+          path: ci-release/
+          if-no-files-found: warn
+
+      - name: Create GitHub Release
+        if: ${{ env.TAG != '' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: RogueCleaner ${{ env.TAG }}
+          fail_on_missing_files: true
+          files: |
+            ${{ steps.package.outputs.FILES }}
+          body: |
+            流氓软件克星：扫描和清理 Windows 流氓右键菜单、自启动、计划任务、服务、浏览器插件和文件关联残留。
+
+            - `RogueCleaner-v*.exe`：绿色单文件版
+            - `RogueCleaner-Transparent-*.rar`：仅含 exe 的发布包
+            - `RogueCleaner-Source-*.rar`：源码包
+            - `SHA256SUMS-*.txt`：SHA256 校验和
+
+            本 release 由 GitHub Actions 构建（未签名）。
